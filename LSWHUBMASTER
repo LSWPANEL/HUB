@@ -1,0 +1,1398 @@
+-- LSW Hub Launcher v1
+-- LocalScript -> StarterPlayer > StarterPlayerScripts
+-- A small rectangle with 3 buttons: Egg Farm Simulator | Sniper Arena | Brainrot Heads
+-- Egg Farm Simulator / Brainrot Heads open their own panel with tabs: Farm | Colors | Settings
+-- Sniper Arena button -> loads the LSW Hub loadstring directly (no panel).
+-- Brainrot Heads Farm tab: Equip Best, Claim Rewards, Auto Collect Money (pads 1-36), Speed, Fly, Noclip.
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local lp = Players.LocalPlayer
+local playerGui = lp:WaitForChild("PlayerGui")
+
+for _, g in ipairs(playerGui:GetChildren()) do
+	if string.sub(g.Name, 1, 7) == "LSWHUB_" then g:Destroy() end
+end
+
+local SIZES = {
+	Small = UDim2.fromOffset(340, 400),
+	Medium = UDim2.fromOffset(400, 460),
+	Large = UDim2.fromOffset(480, 560),
+}
+local OFFGREY = Color3.fromRGB(70, 70, 80)
+local ON_COLOR = Color3.fromRGB(60, 180, 90)
+local OFF_COLOR = Color3.fromRGB(180, 60, 60)
+
+local SNIPER_ARENA_URL = "https://raw.githubusercontent.com/LSWPANEL/LSW_Hub/refs/heads/main/LswHub"
+
+---------------------------------------------------------------- Shared helpers
+local function round(obj, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 6)
+	c.Parent = obj
+end
+
+local function makeButton(parent, text, size, pos, color)
+	local b = Instance.new("TextButton")
+	b.Text = text
+	b.Size = size
+	b.Position = pos or UDim2.new()
+	b.BackgroundColor3 = color or Color3.fromRGB(90, 120, 255)
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 13
+	b.Parent = parent
+	round(b)
+	return b
+end
+
+local function makeLabel(parent, text, size, pos)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Size = size or UDim2.new(1, -20, 0, 30)
+	l.Position = pos or UDim2.new(0, 10, 0, 2)
+	l.Text = text
+	l.TextColor3 = Color3.fromRGB(235, 235, 235)
+	l.Font = Enum.Font.GothamMedium
+	l.TextSize = 13
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = parent
+	return l
+end
+
+local function makeDraggable(connect, handle, target, onClick)
+	local dragging, startPos, startMouse, moved
+	connect(handle.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			startMouse = input.Position
+			startPos = target.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if not moved and onClick then onClick() end
+				end
+			end)
+		end
+	end)
+	connect(UIS.InputChanged, function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - startMouse
+			if d.Magnitude > 4 then moved = true end
+			target.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y
+			)
+		end
+	end)
+end
+
+-- color slider: white -> full rainbow -> black
+local WHITE_END, BLACK_START = 0.07, 0.93
+local function colorAt(t)
+	t = math.clamp(t, 0, 1)
+	if t < WHITE_END then
+		return Color3.new(1, 1, 1):Lerp(Color3.fromHSV(0, 1, 1), t / WHITE_END)
+	elseif t > BLACK_START then
+		return Color3.fromHSV(0.92, 1, 1):Lerp(Color3.new(0, 0, 0), (t - BLACK_START) / (1 - BLACK_START))
+	end
+	return Color3.fromHSV((t - WHITE_END) / (BLACK_START - WHITE_END) * 0.92, 1, 1)
+end
+
+local SLIDER_SEQ
+do
+	local kp = { ColorSequenceKeypoint.new(0, colorAt(0)) }
+	for i = 0, 14 do
+		local t = WHITE_END + (BLACK_START - WHITE_END) * (i / 14)
+		kp[#kp + 1] = ColorSequenceKeypoint.new(math.min(t, 0.999), colorAt(t))
+	end
+	kp[#kp + 1] = ColorSequenceKeypoint.new(1, colorAt(1))
+	SLIDER_SEQ = ColorSequence.new(kp)
+end
+
+local function posForColor(c)
+	local best, bestD = 0, math.huge
+	for i = 0, 240 do
+		local t = i / 240
+		local cc = colorAt(t)
+		local d = (cc.R - c.R) ^ 2 + (cc.G - c.G) ^ 2 + (cc.B - c.B) ^ 2
+		if d < bestD then best, bestD = t, d end
+	end
+	return best
+end
+
+-- preset value encoding
+local function encodeValue(v)
+	local t = typeof(v)
+	if t == "Color3" then return { c = v:ToHex() } end
+	if t == "EnumItem" then return { k = v.Name } end
+	return v
+end
+
+local function decodeValue(saved, default)
+	local dt = typeof(default)
+	if dt == "Color3" then
+		if type(saved) == "table" and type(saved.c) == "string" then
+			local ok, c = pcall(Color3.fromHex, saved.c)
+			if ok and typeof(c) == "Color3" then return c end
+		end
+		return nil
+	elseif dt == "EnumItem" then
+		if type(saved) == "table" and type(saved.k) == "string" then
+			local ok, item = pcall(function() return Enum.KeyCode[saved.k] end)
+			if ok and item then return item end
+		end
+		return nil
+	elseif type(saved) == dt then
+		return saved
+	end
+	return nil
+end
+
+---------------------------------------------------------------- Panel factory
+-- def = { id = "...", title = "...", farm = function(ctx) ... end }
+local function buildPanel(def, onClosed)
+	local conns = {}
+	local function connect(signal, fn)
+		local c = signal:Connect(fn)
+		conns[#conns + 1] = c
+		return c
+	end
+
+	local cfg = {
+		ui = {
+			accent = Color3.fromRGB(90, 120, 255),
+			secondary = Color3.fromRGB(45, 45, 58),
+			secondaryTransparency = 0,
+			background = Color3.fromRGB(28, 28, 34),
+			transparency = 0,
+			rainbowSpeed = 0.2,
+			size = "Medium",
+			toggleKey = Enum.KeyCode.RightShift,
+			minKey = Enum.KeyCode.RightControl,
+		},
+		snow = {
+			enabled = true,
+			amount = 45,
+			speed = 1,
+			size = 1,
+			color = Color3.fromRGB(235, 245, 255),
+		},
+		farm = {
+			equipLoop = false,
+			claimLoop = false,
+			collectLoop = false,
+			loopDelay = 1,
+			speedOn = false,
+			speedValue = 40,
+			fly = false,
+			flySpeed = 60,
+			noclip = false,
+		},
+		preset = {
+			name = "default",
+			autoSave = true,
+		},
+	}
+
+	local defaults = {}
+	for _, t in pairs(cfg) do
+		local copy = {}
+		for k, v in pairs(t) do copy[k] = v end
+		defaults[t] = copy
+	end
+	local function defaultOf(tbl, key) return defaults[tbl][key] end
+
+	local rainbowPickers, accentFns, resetFns, refreshFns, surfaceObjs = {}, {}, {}, {}, {}
+	local dirty = false
+	local function markDirty() dirty = true end
+
+	------------------------------------------------------------ Storage (executor file)
+	local fileName = "LSWHub_" .. def.id .. ".json"
+	local env = getfenv()
+	local wf, rf, isf = env.writefile, env.readfile, env.isfile
+	local canSave = typeof(wf) == "function" and typeof(rf) == "function"
+	local SECTIONS = { "ui", "snow", "farm" }
+	-- on/off switches are never restored from a preset, so nothing starts by itself
+	local NO_SAVE = { equipLoop = true, claimLoop = true, collectLoop = true, speedOn = true, fly = true, noclip = true }
+
+	local function readBlob()
+		if canSave then
+			if typeof(isf) == "function" then
+				local ok, exists = pcall(isf, fileName)
+				if ok and not exists then return { presets = {} } end
+			end
+			local ok, raw = pcall(rf, fileName)
+			if ok and type(raw) == "string" and raw ~= "" then
+				local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
+				if ok2 and type(data) == "table" then
+					if type(data.presets) ~= "table" then data.presets = {} end
+					return data
+				end
+			end
+		end
+		return { presets = {} }
+	end
+
+	local function writeBlob(blob)
+		if not canSave then return false end
+		local ok, str = pcall(function() return HttpService:JSONEncode(blob) end)
+		if not ok then return false end
+		return (pcall(wf, fileName, str))
+	end
+
+	local pendingRainbow = {}
+	local function applySettings(settings)
+		if type(settings) ~= "table" then return end
+		for _, sec in ipairs(SECTIONS) do
+			local s = settings[sec]
+			if type(s) == "table" then
+				for k, saved in pairs(s) do
+					local cur = cfg[sec][k]
+					if cur ~= nil then
+						if not (sec == "farm" and NO_SAVE[k]) then
+							local v = decodeValue(saved, cur)
+							if v ~= nil then cfg[sec][k] = v end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local function snapshot()
+		local out = { settings = {}, rainbow = {} }
+		for _, sec in ipairs(SECTIONS) do
+			local s = {}
+			for k, v in pairs(cfg[sec]) do
+				if not (sec == "farm" and NO_SAVE[k]) then s[k] = encodeValue(v) end
+			end
+			out.settings[sec] = s
+		end
+		for i, p in ipairs(rainbowPickers) do out.rainbow[i] = p.on end
+		return out
+	end
+
+	local startupBlob = readBlob()
+	local startupData
+	if type(startupBlob.startup) == "string" and type(startupBlob.presets[startupBlob.startup]) == "table" then
+		startupData = startupBlob.presets[startupBlob.startup]
+		cfg.preset.name = startupBlob.startup
+		applySettings(startupData.settings)
+		if type(startupData.rainbow) == "table" then pendingRainbow = startupData.rainbow end
+	end
+
+	------------------------------------------------------------ Theme
+	local function bindAccent(fn)
+		accentFns[#accentFns + 1] = fn
+		fn(cfg.ui.accent)
+	end
+
+	local function surfaceColor(kind)
+		if kind == "bg" then return cfg.ui.background end
+		if kind == "sec" then return cfg.ui.secondary end
+		return cfg.ui.background:Lerp(Color3.new(0, 0, 0), 0.35)
+	end
+	local function applySurface(obj, kind)
+		obj.BackgroundColor3 = surfaceColor(kind)
+		if kind == "sec" then
+			obj.BackgroundTransparency = cfg.ui.secondaryTransparency
+		elseif kind == "bg" then
+			obj.BackgroundTransparency = cfg.ui.transparency
+		end
+	end
+	local function surface(obj, kind)
+		surfaceObjs[#surfaceObjs + 1] = { obj, kind }
+		applySurface(obj, kind)
+		return obj
+	end
+
+	------------------------------------------------------------ Window
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "LSWHUB_" .. def.id
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 10
+	gui.Parent = playerGui
+
+	local main = Instance.new("Frame")
+	main.Size = SIZES[cfg.ui.size] or SIZES.Medium
+	main.Position = UDim2.new(0.5, -200, 0.5, -230)
+	main.BorderSizePixel = 0
+	main.Parent = gui
+	surface(main, "bg")
+	round(main, 10)
+
+	-- snowfall (behind everything: ZIndex 0)
+	local setSnowAmount, updateSnow
+	do
+		local snowFrame = Instance.new("Frame")
+		snowFrame.Name = "Snow"
+		snowFrame.BackgroundTransparency = 1
+		snowFrame.Size = UDim2.new(1, 0, 1, 0)
+		snowFrame.ClipsDescendants = true
+		snowFrame.ZIndex = 0
+		snowFrame.Parent = main
+
+		local flakes = {}
+		local lastColor = nil
+
+		local function bounds()
+			local w, h = snowFrame.AbsoluteSize.X, snowFrame.AbsoluteSize.Y
+			if w < 10 or h < 10 then
+				local s = SIZES[cfg.ui.size] or SIZES.Medium
+				w, h = s.X.Offset, s.Y.Offset
+			end
+			return w, h
+		end
+
+		local function newFlake()
+			local f = Instance.new("Frame")
+			f.BorderSizePixel = 0
+			f.BackgroundColor3 = cfg.snow.color
+			f.ZIndex = 0
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(1, 0)
+			c.Parent = f
+			f.Parent = snowFrame
+			local w, h = bounds()
+			f.BackgroundTransparency = math.random(5, 45) / 100
+			flakes[#flakes + 1] = {
+				frame = f,
+				x = math.random() * w,
+				y = math.random() * h,
+				speed = math.random(25, 70),
+				size = math.random(20, 50) / 10,
+				phase = math.random() * 6.28,
+				drift = math.random(8, 22),
+			}
+		end
+
+		function setSnowAmount(n)
+			while #flakes < n do newFlake() end
+			while #flakes > n do
+				local d = table.remove(flakes)
+				d.frame:Destroy()
+			end
+		end
+
+		function updateSnow(dt)
+			local S = cfg.snow
+			local visible = S.enabled and main.Visible
+			snowFrame.Visible = visible
+			if not visible then return end
+			local w, h = bounds()
+			local t = os.clock()
+			local recolor = (lastColor ~= S.color)
+			for _, d in ipairs(flakes) do
+				d.y += d.speed * S.speed * dt
+				d.x += math.sin(t + d.phase) * d.drift * dt
+				if d.y > h + 6 then
+					d.y = -6
+					d.x = math.random() * w
+				end
+				if d.x > w + 6 then d.x = -6 elseif d.x < -6 then d.x = w + 6 end
+				local sz = d.size * S.size
+				d.frame.Size = UDim2.fromOffset(sz, sz)
+				d.frame.Position = UDim2.fromOffset(d.x, d.y)
+				if recolor then d.frame.BackgroundColor3 = S.color end
+			end
+			lastColor = S.color
+		end
+
+		setSnowAmount(cfg.snow.amount)
+	end
+
+	local closeBtn, minimize, restore
+	do
+		local titleBar = Instance.new("Frame")
+		titleBar.Size = UDim2.new(1, 0, 0, 34)
+		titleBar.BorderSizePixel = 0
+		titleBar.Parent = main
+		surface(titleBar, "sec")
+		round(titleBar, 10)
+
+		local title = makeLabel(titleBar, def.title, UDim2.new(1, -90, 1, 0), UDim2.new(0, 12, 0, 0))
+		title.Font = Enum.Font.GothamBold
+		title.TextSize = 15
+
+		local minBtn = makeButton(titleBar, "-", UDim2.fromOffset(28, 24), UDim2.new(1, -66, 0, 5), Color3.fromRGB(200, 160, 50))
+		closeBtn = makeButton(titleBar, "X", UDim2.fromOffset(28, 24), UDim2.new(1, -34, 0, 5), OFF_COLOR)
+
+		local block = Instance.new("TextButton")
+		block.Size = UDim2.fromOffset(56, 56)
+		block.Text = "LSW"
+		block.TextColor3 = Color3.new(1, 1, 1)
+		block.Font = Enum.Font.GothamBlack
+		block.TextSize = 18
+		block.AutoButtonColor = false
+		block.Visible = false
+		block.Parent = gui
+		round(block, 10)
+		bindAccent(function(c) block.BackgroundColor3 = c end)
+
+		function minimize()
+			block.Position = main.Position
+			main.Visible = false
+			block.Visible = true
+		end
+		function restore()
+			main.Position = block.Position
+			block.Visible = false
+			main.Visible = true
+		end
+		minBtn.MouseButton1Click:Connect(minimize)
+		makeDraggable(connect, titleBar, main)
+		makeDraggable(connect, block, block, restore)
+	end
+
+	------------------------------------------------------------ Tabs
+	local tabs = {}
+	local currentTab = nil
+	local function selectTab(name)
+		for n, t in pairs(tabs) do
+			t.page.Visible = (n == name)
+			if n == name then
+				t.btn.BackgroundColor3 = cfg.ui.accent
+				t.btn.BackgroundTransparency = 0
+			else
+				t.btn.BackgroundColor3 = cfg.ui.secondary
+				t.btn.BackgroundTransparency = cfg.ui.secondaryTransparency
+			end
+		end
+		currentTab = name
+	end
+
+	local function themeChanged()
+		for _, s in ipairs(surfaceObjs) do applySurface(s[1], s[2]) end
+		for _, f in ipairs(accentFns) do f(cfg.ui.accent) end
+		if currentTab then selectTab(currentTab) end
+	end
+
+	do
+		local tabNames = { "Farm", "Colors", "Settings" }
+		local tabBar = Instance.new("Frame")
+		tabBar.Size = UDim2.new(1, -20, 0, 28)
+		tabBar.Position = UDim2.new(0, 10, 0, 40)
+		tabBar.BackgroundTransparency = 1
+		tabBar.Parent = main
+
+		for i, name in ipairs(tabNames) do
+			local btn = makeButton(tabBar, name, UDim2.new(1 / #tabNames, -4, 1, 0),
+				UDim2.new((i - 1) / #tabNames, 0, 0, 0))
+			btn.TextScaled = true
+			local limit = Instance.new("UITextSizeConstraint")
+			limit.MaxTextSize = 13
+			limit.Parent = btn
+
+			local page = Instance.new("ScrollingFrame")
+			page.Size = UDim2.new(1, -20, 1, -80)
+			page.Position = UDim2.new(0, 10, 0, 74)
+			page.BackgroundTransparency = 1
+			page.BorderSizePixel = 0
+			page.ScrollBarThickness = 5
+			page.CanvasSize = UDim2.new()
+			page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+			page.Visible = false
+			page.Parent = main
+
+			local l = Instance.new("UIListLayout")
+			l.Padding = UDim.new(0, 6)
+			l.SortOrder = Enum.SortOrder.LayoutOrder
+			l.Parent = page
+
+			tabs[name] = { page = page, btn = btn }
+			btn.MouseButton1Click:Connect(function() selectTab(name) end)
+		end
+	end
+
+	------------------------------------------------------------ Controls
+	local orderCounter = 0
+	local function row(page, h, noSurface)
+		orderCounter += 1
+		local f = Instance.new("Frame")
+		f.Size = UDim2.new(1, -8, 0, h or 34)
+		f.BorderSizePixel = 0
+		f.LayoutOrder = orderCounter
+		f.Parent = page
+		if noSurface then
+			f.BackgroundTransparency = 1
+		else
+			surface(f, "sec")
+			round(f, 6)
+		end
+		return f
+	end
+
+	local function header(page, text)
+		orderCounter += 1
+		local l = makeLabel(page, text, UDim2.new(1, -8, 0, 24))
+		l.Font = Enum.Font.GothamBold
+		l.TextSize = 14
+		l.LayoutOrder = orderCounter
+		bindAccent(function(c) l.TextColor3 = c end)
+	end
+
+	local function toggle(page, text, tbl, key, onChange)
+		local f = row(page)
+		makeLabel(f, text, UDim2.new(1, -70, 1, 0), UDim2.new(0, 10, 0, 0))
+		local sw = Instance.new("TextButton")
+		sw.Text = ""
+		sw.Size = UDim2.fromOffset(44, 22)
+		sw.Position = UDim2.new(1, -54, 0.5, -11)
+		sw.Parent = f
+		round(sw, 11)
+		local knob = Instance.new("Frame")
+		knob.Size = UDim2.fromOffset(18, 18)
+		knob.BackgroundColor3 = Color3.new(1, 1, 1)
+		knob.Parent = sw
+		round(knob, 9)
+
+		local default = defaultOf(tbl, key)
+		local function refresh()
+			local on = tbl[key]
+			sw.BackgroundColor3 = on and cfg.ui.accent or OFFGREY
+			knob.Position = on and UDim2.new(1, -20, 0, 2) or UDim2.new(0, 2, 0, 2)
+		end
+		bindAccent(refresh)
+		refreshFns[#refreshFns + 1] = refresh
+		local function set(v)
+			tbl[key] = v
+			refresh()
+			markDirty()
+			if onChange then onChange(v) end
+		end
+		sw.MouseButton1Click:Connect(function() set(not tbl[key]) end)
+		resetFns[#resetFns + 1] = function() set(default) end
+		return set
+	end
+
+	local function slider(page, text, tbl, key, min, max, step, onChange)
+		local f = row(page, 50)
+		local lbl = makeLabel(f, "", UDim2.new(1, -20, 0, 24))
+		local hit = Instance.new("TextButton")
+		hit.Text = ""
+		hit.BackgroundTransparency = 1
+		hit.Size = UDim2.new(1, -20, 0, 22)
+		hit.Position = UDim2.new(0, 10, 0, 26)
+		hit.Parent = f
+		local bar = Instance.new("Frame")
+		bar.Size = UDim2.new(1, 0, 0, 6)
+		bar.Position = UDim2.new(0, 0, 0.5, -3)
+		bar.BorderSizePixel = 0
+		bar.Parent = hit
+		surface(bar, "box")
+		round(bar, 3)
+		local fill = Instance.new("Frame")
+		fill.BorderSizePixel = 0
+		fill.Parent = bar
+		round(fill, 3)
+		bindAccent(function(c) fill.BackgroundColor3 = c end)
+
+		local function set(v, fire)
+			v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+			tbl[key] = v
+			fill.Size = UDim2.new((v - min) / (max - min), 0, 1, 0)
+			lbl.Text = text .. ": " .. tostring(math.floor(v * 100 + 0.5) / 100)
+			if fire then
+				markDirty()
+				if onChange then onChange(v) end
+			end
+		end
+		local default = defaultOf(tbl, key)
+		set(tbl[key], false)
+		refreshFns[#refreshFns + 1] = function() set(tbl[key], false) end
+
+		local dragging = false
+		local function fromX(x)
+			local rel = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+			set(min + (max - min) * rel, true)
+		end
+		hit.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				fromX(input.Position.X)
+			end
+		end)
+		connect(UIS.InputChanged, function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch) then
+				fromX(input.Position.X)
+			end
+		end)
+		connect(UIS.InputEnded, function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+		resetFns[#resetFns + 1] = function() set(default, true) end
+	end
+
+	local function cycle(page, text, tbl, key, options, onChange)
+		local f = row(page)
+		makeLabel(f, text, UDim2.new(1, -170, 1, 0), UDim2.new(0, 10, 0, 0))
+		local btn = makeButton(f, tostring(tbl[key]), UDim2.fromOffset(150, 24), UDim2.new(1, -160, 0.5, -12))
+		btn.TextScaled = true
+		local limit = Instance.new("UITextSizeConstraint")
+		limit.MaxTextSize = 13
+		limit.Parent = btn
+		surface(btn, "box")
+		local default = defaultOf(tbl, key)
+		btn.MouseButton1Click:Connect(function()
+			local idx = table.find(options, tbl[key]) or 0
+			tbl[key] = options[(idx % #options) + 1]
+			btn.Text = tbl[key]
+			markDirty()
+			if onChange then onChange(tbl[key]) end
+		end)
+		refreshFns[#refreshFns + 1] = function() btn.Text = tostring(tbl[key]) end
+		resetFns[#resetFns + 1] = function()
+			tbl[key] = default
+			btn.Text = default
+			markDirty()
+			if onChange then onChange(default) end
+		end
+	end
+
+	local function textInput(page, text, tbl, key, placeholder)
+		local f = row(page)
+		makeLabel(f, text, UDim2.new(1, -150, 1, 0), UDim2.new(0, 10, 0, 0))
+		local box = Instance.new("TextBox")
+		box.Size = UDim2.fromOffset(130, 24)
+		box.Position = UDim2.new(1, -140, 0.5, -12)
+		box.TextColor3 = Color3.new(1, 1, 1)
+		box.PlaceholderText = placeholder or ""
+		box.PlaceholderColor3 = Color3.fromRGB(120, 120, 120)
+		box.Font = Enum.Font.Code
+		box.TextSize = 12
+		box.ClearTextOnFocus = false
+		box.Text = tbl[key]
+		box.Parent = f
+		surface(box, "box")
+		round(box, 5)
+		local default = defaultOf(tbl, key)
+		box.FocusLost:Connect(function()
+			tbl[key] = box.Text
+			markDirty()
+		end)
+		refreshFns[#refreshFns + 1] = function() box.Text = tbl[key] end
+		resetFns[#resetFns + 1] = function()
+			tbl[key] = default
+			box.Text = default
+			markDirty()
+		end
+	end
+
+	local listening
+	local function keybind(page, text, tbl, key)
+		local f = row(page)
+		makeLabel(f, text, UDim2.new(1, -150, 1, 0), UDim2.new(0, 10, 0, 0))
+		local btn = makeButton(f, tbl[key].Name, UDim2.fromOffset(130, 24), UDim2.new(1, -140, 0.5, -12))
+		surface(btn, "box")
+		local default = defaultOf(tbl, key)
+		btn.MouseButton1Click:Connect(function()
+			btn.Text = "press a key..."
+			listening = function(kc)
+				if kc ~= Enum.KeyCode.Escape then
+					tbl[key] = kc
+					markDirty()
+				end
+				btn.Text = tbl[key].Name
+			end
+		end)
+		refreshFns[#refreshFns + 1] = function() btn.Text = tbl[key].Name end
+		resetFns[#resetFns + 1] = function()
+			tbl[key] = default
+			btn.Text = default.Name
+			markDirty()
+		end
+	end
+
+	local function actionButton(page, text, color, fn)
+		local f = row(page, 34, true)
+		local b = makeButton(f, text, UDim2.new(1, 0, 1, 0), nil, color)
+		b.MouseButton1Click:Connect(fn)
+		return b
+	end
+
+	local rainbowCounter = 0
+	local function colorPick(page, text, tbl, key, onChange)
+		local f = row(page, 98)
+		local lbl = makeLabel(f, "", UDim2.new(1, -70, 0, 26))
+		local preview = Instance.new("Frame")
+		preview.Size = UDim2.fromOffset(46, 18)
+		preview.Position = UDim2.new(1, -56, 0, 6)
+		preview.BorderSizePixel = 0
+		preview.Parent = f
+		round(preview, 4)
+
+		local hit = Instance.new("TextButton")
+		hit.Text = ""
+		hit.BackgroundTransparency = 1
+		hit.Size = UDim2.new(1, -20, 0, 28)
+		hit.Position = UDim2.new(0, 10, 0, 28)
+		hit.Parent = f
+
+		local bar = Instance.new("Frame")
+		bar.Size = UDim2.new(1, 0, 0, 12)
+		bar.Position = UDim2.new(0, 0, 0.5, -6)
+		bar.BackgroundColor3 = Color3.new(1, 1, 1)
+		bar.BorderSizePixel = 0
+		bar.Parent = hit
+		round(bar, 6)
+		local grad = Instance.new("UIGradient")
+		grad.Color = SLIDER_SEQ
+		grad.Parent = bar
+
+		local marker = Instance.new("Frame")
+		marker.Size = UDim2.fromOffset(4, 22)
+		marker.BackgroundColor3 = Color3.new(1, 1, 1)
+		marker.BorderSizePixel = 0
+		marker.ZIndex = 2
+		marker.Parent = hit
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Color3.new(0, 0, 0)
+		stroke.Thickness = 1
+		stroke.Parent = marker
+
+		local hexBox = Instance.new("TextBox")
+		hexBox.Size = UDim2.fromOffset(90, 26)
+		hexBox.Position = UDim2.new(0, 10, 0, 64)
+		hexBox.TextColor3 = Color3.new(1, 1, 1)
+		hexBox.Font = Enum.Font.Code
+		hexBox.TextSize = 13
+		hexBox.ClearTextOnFocus = false
+		hexBox.PlaceholderText = "HEX"
+		hexBox.Text = ""
+		hexBox.Parent = f
+		surface(hexBox, "box")
+		round(hexBox, 5)
+
+		local rbBtn = makeButton(f, "Rainbow: OFF", UDim2.fromOffset(120, 26), UDim2.new(1, -130, 0, 64), OFFGREY)
+
+		local default = defaultOf(tbl, key)
+		local idx = #rainbowPickers + 1
+		local p = { on = pendingRainbow[idx] == true, offset = (rainbowCounter * 0.11) % 1 }
+		rainbowCounter += 1
+		local pos = posForColor(tbl[key])
+
+		local function refresh()
+			local c = tbl[key]
+			preview.BackgroundColor3 = c
+			lbl.Text = text .. "  #" .. c:ToHex():upper()
+			if not hexBox:IsFocused() then hexBox.Text = c:ToHex():upper() end
+			marker.Position = UDim2.new(pos, -2, 0.5, -11)
+			marker.Visible = not p.on
+			rbBtn.Text = p.on and "Rainbow: ON" or "Rainbow: OFF"
+			rbBtn.BackgroundColor3 = p.on and ON_COLOR or OFFGREY
+		end
+		local function commit(fire)
+			refresh()
+			if fire and onChange then onChange(tbl[key]) end
+		end
+
+		function p.apply(c)
+			tbl[key] = c
+			commit(true)
+		end
+		function p.setOn(v)
+			p.on = v
+			if not v then pos = posForColor(tbl[key]) end
+			markDirty()
+			commit(false)
+		end
+		rainbowPickers[idx] = p
+
+		refreshFns[#refreshFns + 1] = function()
+			p.on = pendingRainbow[idx] == true
+			pos = posForColor(tbl[key])
+			refresh()
+		end
+
+		local dragging = false
+		local function fromX(x)
+			if p.on then return end
+			pos = math.clamp((x - hit.AbsolutePosition.X) / hit.AbsoluteSize.X, 0, 1)
+			tbl[key] = colorAt(pos)
+			markDirty()
+			commit(true)
+		end
+		hit.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				fromX(input.Position.X)
+			end
+		end)
+		connect(UIS.InputChanged, function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch) then
+				fromX(input.Position.X)
+			end
+		end)
+		connect(UIS.InputEnded, function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+
+		hexBox.FocusLost:Connect(function()
+			local s = string.gsub(hexBox.Text, "#", "")
+			local ok, c = pcall(Color3.fromHex, s)
+			if ok and typeof(c) == "Color3" then
+				p.on = false
+				tbl[key] = c
+				pos = posForColor(c)
+				markDirty()
+				commit(true)
+			else
+				commit(false)
+			end
+		end)
+
+		rbBtn.MouseButton1Click:Connect(function() p.setOn(not p.on) end)
+
+		resetFns[#resetFns + 1] = function()
+			p.on = false
+			tbl[key] = default
+			pos = posForColor(default)
+			markDirty()
+			commit(true)
+		end
+
+		refresh()
+	end
+
+	------------------------------------------------------------ Farm tab (per game)
+	local cleanups = {}
+	local ctx = {
+		page = tabs.Farm.page,
+		cfg = cfg,
+		row = row,
+		header = header,
+		toggle = toggle,
+		slider = slider,
+		actionButton = actionButton,
+		bindAccent = bindAccent,
+		connect = connect,
+		cleanups = cleanups,
+	}
+	if def.farm then def.farm(ctx) end
+
+	------------------------------------------------------------ Colors tab
+	do
+		local cp = tabs.Colors.page
+		header(cp, "Rainbow Mode")
+		slider(cp, "Rainbow Speed", cfg.ui, "rainbowSpeed", 0.02, 1, 0.02)
+		actionButton(cp, "Rainbow: ALL ON", Color3.fromRGB(150, 90, 230), function()
+			for _, p in ipairs(rainbowPickers) do p.setOn(true) end
+		end)
+		actionButton(cp, "Rainbow: ALL OFF", Color3.fromRGB(120, 120, 140), function()
+			for _, p in ipairs(rainbowPickers) do p.setOn(false) end
+		end)
+
+		header(cp, "Interface")
+		colorPick(cp, "Primary (buttons, toggles, tabs)", cfg.ui, "accent", themeChanged)
+		colorPick(cp, "Secondary (panels, rows, tabs)", cfg.ui, "secondary", themeChanged)
+		slider(cp, "Secondary Transparency", cfg.ui, "secondaryTransparency", 0, 0.9, 0.05, themeChanged)
+		colorPick(cp, "Background", cfg.ui, "background", themeChanged)
+		slider(cp, "Background Transparency", cfg.ui, "transparency", 0, 0.6, 0.05, themeChanged)
+
+		header(cp, "Snowfall")
+		colorPick(cp, "Snow Color", cfg.snow, "color")
+	end
+
+	------------------------------------------------------------ Presets
+	local presetStatus
+	local function setPresetStatus(s)
+		if presetStatus then presetStatus.Text = s end
+	end
+	local function cleanName(name)
+		name = tostring(name or ""):match("^%s*(.-)%s*$")
+		if name == "" then name = "default" end
+		return name
+	end
+	local function listNames(blob)
+		local names = {}
+		for n in pairs(blob.presets) do names[#names + 1] = n end
+		table.sort(names)
+		return #names > 0 and table.concat(names, ", ") or "none"
+	end
+
+	local function refreshAllUi()
+		main.Size = SIZES[cfg.ui.size] or SIZES.Medium
+		setSnowAmount(cfg.snow.amount)
+		for _, fn in ipairs(refreshFns) do fn() end
+		themeChanged()
+	end
+
+	local function savePreset(name, silent)
+		name = cleanName(name)
+		local blob = readBlob()
+		blob.presets[name] = snapshot()
+		blob.startup = name
+		local ok = writeBlob(blob)
+		if ok then
+			if not silent then setPresetStatus("saved '" .. name .. "' (loads on start) | presets: " .. listNames(blob)) end
+		else
+			dirty = true
+			setPresetStatus(canSave and "SAVE FAILED" or "SAVE FAILED - no writefile in this environment")
+		end
+		return ok
+	end
+
+	local function loadPreset(name)
+		name = cleanName(name)
+		local blob = readBlob()
+		local data = blob.presets[name]
+		if type(data) ~= "table" then
+			setPresetStatus("no preset '" .. name .. "' | presets: " .. listNames(blob))
+			return
+		end
+		cfg.preset.name = name
+		applySettings(data.settings)
+		pendingRainbow = type(data.rainbow) == "table" and data.rainbow or {}
+		refreshAllUi()
+		setPresetStatus("loaded '" .. name .. "'")
+	end
+
+	local function deletePreset(name)
+		name = cleanName(name)
+		local blob = readBlob()
+		if blob.presets[name] == nil then
+			setPresetStatus("no preset '" .. name .. "' | presets: " .. listNames(blob))
+			return
+		end
+		blob.presets[name] = nil
+		if blob.startup == name then blob.startup = nil end
+		if writeBlob(blob) then
+			setPresetStatus("deleted '" .. name .. "' | presets: " .. listNames(blob))
+		else
+			setPresetStatus("DELETE FAILED")
+		end
+	end
+
+	local lastAuto = 0
+	connect(RunService.Heartbeat, function()
+		if not dirty or not cfg.preset.autoSave or not canSave then return end
+		local now = os.clock()
+		if now - lastAuto < 10 then return end
+		lastAuto = now
+		dirty = false
+		task.spawn(savePreset, cfg.preset.name, true)
+	end)
+
+	------------------------------------------------------------ Settings tab
+	do
+		local sp = tabs.Settings.page
+
+		header(sp, "Presets")
+		textInput(sp, "Preset Name", cfg.preset, "name", "default")
+		toggle(sp, "Auto-Save Changes", cfg.preset, "autoSave")
+
+		local btnRow = row(sp, 34, true)
+		local function presetButton(i, text, color, fn)
+			local b = makeButton(btnRow, text, UDim2.new(1 / 3, -4, 1, 0), UDim2.new((i - 1) / 3, 0, 0, 0), color)
+			b.MouseButton1Click:Connect(fn)
+		end
+		presetButton(1, "Save", ON_COLOR, function() task.spawn(savePreset, cfg.preset.name) end)
+		presetButton(2, "Load", Color3.fromRGB(90, 120, 255), function() task.spawn(loadPreset, cfg.preset.name) end)
+		presetButton(3, "Delete", OFF_COLOR, function() task.spawn(deletePreset, cfg.preset.name) end)
+
+		local statusRow = row(sp, 46)
+		presetStatus = makeLabel(statusRow, "", UDim2.new(1, -20, 1, 0), UDim2.new(0, 10, 0, 0))
+		presetStatus.TextWrapped = true
+		presetStatus.TextSize = 12
+		if startupData then
+			presetStatus.Text = "auto-loaded '" .. cfg.preset.name .. "'"
+		elseif not canSave then
+			presetStatus.Text = "No writefile here - presets only last this session."
+		else
+			presetStatus.Text = "No saved preset yet. Press Save."
+		end
+
+		header(sp, "Window")
+		cycle(sp, "Window Size", cfg.ui, "size", { "Small", "Medium", "Large" }, function(v)
+			main.Size = SIZES[v]
+		end)
+		keybind(sp, "Hide/Show GUI Key", cfg.ui, "toggleKey")
+		keybind(sp, "Minimize Key", cfg.ui, "minKey")
+
+		header(sp, "Snowfall")
+		toggle(sp, "Snowfall Background", cfg.snow, "enabled")
+		slider(sp, "Snow Amount", cfg.snow, "amount", 0, 120, 5, setSnowAmount)
+		slider(sp, "Snow Speed", cfg.snow, "speed", 0.2, 3, 0.1)
+		slider(sp, "Snow Size", cfg.snow, "size", 0.5, 3, 0.1)
+
+		header(sp, "Actions")
+		actionButton(sp, "Reset All Settings", Color3.fromRGB(120, 120, 140), function()
+			for _, fn in ipairs(resetFns) do fn() end
+		end)
+
+		local function unload()
+			if cfg.preset.autoSave and canSave then pcall(savePreset, cfg.preset.name, true) end
+			for k, v in pairs(cfg.farm) do
+				if type(v) == "boolean" then cfg.farm[k] = false end
+			end
+			for _, fn in ipairs(cleanups) do pcall(fn) end
+			for _, c in ipairs(conns) do c:Disconnect() end
+			gui:Destroy()
+			if onClosed then onClosed() end
+		end
+		actionButton(sp, "Unload GUI", OFF_COLOR, unload)
+		closeBtn.MouseButton1Click:Connect(unload)
+	end
+
+	------------------------------------------------------------ Main loop + keybinds
+	connect(RunService.RenderStepped, function(dt)
+		local base = os.clock() * cfg.ui.rainbowSpeed
+		for _, p in ipairs(rainbowPickers) do
+			if p.on then p.apply(Color3.fromHSV((base + p.offset) % 1, 1, 1)) end
+		end
+		updateSnow(dt)
+	end)
+
+	connect(UIS.InputBegan, function(input, gp)
+		if listening and input.UserInputType == Enum.UserInputType.Keyboard then
+			local cb = listening
+			listening = nil
+			cb(input.KeyCode)
+			return
+		end
+		if gp then return end
+		if input.KeyCode == cfg.ui.toggleKey then
+			gui.Enabled = not gui.Enabled
+		elseif input.KeyCode == cfg.ui.minKey then
+			if main.Visible then minimize() else restore() end
+		end
+	end)
+
+	-- startup preset: rainbow flags + refresh now that the UI exists
+	if startupData then refreshAllUi() end
+	dirty = false
+
+	selectTab("Farm")
+
+	return {
+		gui = gui,
+		show = function() gui.Enabled = true end,
+		ctx = ctx,
+	}
+end
+
+---------------------------------------------------------------- Farm tab contents
+local function eggFarm(c)
+	c.header(c.page, "Egg Farm Simulator Farm")
+	local r = c.row(c.page, 50)
+	local l = makeLabel(r, "No farm features yet - send me this game's remotes and I'll add them.",
+		UDim2.new(1, -20, 1, 0), UDim2.new(0, 10, 0, 0))
+	l.TextWrapped = true
+	l.TextSize = 12
+end
+
+local function brainrotFarm(c)
+	local page, cfg = c.page, c.cfg
+	local F = cfg.farm
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+	-------------------------------------------------- remotes
+	local container
+	local remotes = {}
+	local function getContainer()
+		if container and container.Parent then return container end
+		local ok, res = pcall(function()
+			local r = ReplicatedStorage:WaitForChild("packages", 5)
+			r = r:WaitForChild("_Index", 5)
+			r = r:WaitForChild("littensy_remo@1.5.3", 5)
+			r = r:WaitForChild("remo", 5)
+			return r:WaitForChild("container", 5)
+		end)
+		if ok and res then container = res end
+		return container
+	end
+
+	-- RemoteEvent -> FireServer, RemoteFunction -> InvokeServer
+	local function call(name, ...)
+		local rem = remotes[name]
+		if not rem or not rem.Parent then
+			local cont = getContainer()
+			rem = cont and cont:WaitForChild(name, 5)
+			if not rem then return false end
+			remotes[name] = rem
+		end
+		local args = table.pack(...)
+		return (pcall(function()
+			if rem:IsA("RemoteFunction") then
+				return rem:InvokeServer(table.unpack(args, 1, args.n))
+			elseif rem:IsA("RemoteEvent") then
+				rem:FireServer(table.unpack(args, 1, args.n))
+			end
+		end))
+	end
+
+	local CLAIMS = {
+		"data.discord.claimReward",
+		"data.follow.claimReward",
+		"data.group.claimReward",
+		"data.rewards.claimFreebie",
+		"data.rewards.claimFriendReward",
+		"data.rewards.claimJoinReward",
+		"data.rewards.claimLeaveReward",
+		"data.rewards.claimOfflineMoney",
+		"data.rewards.claimPlayReward",
+		"game.wheels.claimReward",
+	}
+
+	local function equipBest()
+		call("data.base.equipBestBrainrots")
+	end
+
+	local function claimAll()
+		for _, name in ipairs(CLAIMS) do task.spawn(call, name) end
+	end
+
+	-- pads 1 to 36, one after the other
+	local function collectMoney(loopKey)
+		for pad = 1, 36 do
+			if loopKey and not F[loopKey] then return end
+			call("data.base.collectPadMoney", pad)
+		end
+	end
+
+	-------------------------------------------------- repeat helper
+	local running = {}
+	local function startLoop(key, fn)
+		if running[key] then return end
+		running[key] = true
+		task.spawn(function()
+			while F[key] do
+				pcall(fn)
+				task.wait(math.max(F.loopDelay, 0.05))
+			end
+			running[key] = false
+		end)
+	end
+
+	local function onceButton(text, fn)
+		local b = c.actionButton(page, text, Color3.fromRGB(90, 120, 255), function() task.spawn(fn) end)
+		c.bindAccent(function(col) b.BackgroundColor3 = col end)
+	end
+
+	-------------------------------------------------- UI
+	c.header(page, "Brainrot Heads Farm")
+	c.slider(page, "Repeat Delay (s)", F, "loopDelay", 0.1, 5, 0.1)
+
+	c.header(page, "Equip Best")
+	c.toggle(page, "Auto Equip Best (repeats)", F, "equipLoop", function(on)
+		if on then startLoop("equipLoop", equipBest) end
+	end)
+	onceButton("Equip Best (once)", equipBest)
+
+	c.header(page, "Claim Rewards")
+	c.toggle(page, "Auto Claim All (repeats)", F, "claimLoop", function(on)
+		if on then startLoop("claimLoop", claimAll) end
+	end)
+	onceButton("Claim All (once)", claimAll)
+
+	c.header(page, "Money")
+	c.toggle(page, "Auto Collect Money (pads 1-36)", F, "collectLoop", function(on)
+		if on then startLoop("collectLoop", function() collectMoney("collectLoop") end) end
+	end)
+	onceButton("Collect Money (once)", function() collectMoney(nil) end)
+
+	c.header(page, "Movement")
+	c.toggle(page, "Speed", F, "speedOn")
+	c.slider(page, "Walk Speed", F, "speedValue", 16, 200, 1)
+	c.toggle(page, "Fly (WASD + Space / Shift)", F, "fly")
+	c.slider(page, "Fly Speed", F, "flySpeed", 10, 200, 5)
+	c.toggle(page, "Noclip", F, "noclip")
+
+	-------------------------------------------------- speed / fly / noclip
+	local flyBV, flyBG
+	local origSpeed
+	local noclipped = setmetatable({}, { __mode = "k" })
+
+	local function stopFly()
+		if flyBV then flyBV:Destroy() flyBV = nil end
+		if flyBG then flyBG:Destroy() flyBG = nil end
+		local ch = lp.Character
+		local h = ch and ch:FindFirstChildOfClass("Humanoid")
+		if h then h.PlatformStand = false end
+	end
+
+	local function restoreNoclip()
+		for part in pairs(noclipped) do
+			if part.Parent then part.CanCollide = true end
+		end
+		table.clear(noclipped)
+	end
+
+	c.connect(RunService.Heartbeat, function()
+		local ch = lp.Character
+		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+		local root = ch and ch:FindFirstChild("HumanoidRootPart")
+		if not hum or not root then return end
+
+		if F.speedOn then
+			if not origSpeed then origSpeed = hum.WalkSpeed end
+			if hum.WalkSpeed ~= F.speedValue then hum.WalkSpeed = F.speedValue end
+		elseif origSpeed then
+			hum.WalkSpeed = origSpeed
+			origSpeed = nil
+		end
+
+		if F.fly then
+			local cam = workspace.CurrentCamera
+			if cam then
+				if not flyBV or flyBV.Parent ~= root then
+					stopFly()
+					flyBV = Instance.new("BodyVelocity")
+					flyBV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+					flyBV.Velocity = Vector3.zero
+					flyBV.Parent = root
+					flyBG = Instance.new("BodyGyro")
+					flyBG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+					flyBG.P = 1e4
+					flyBG.Parent = root
+				end
+				hum.PlatformStand = true
+				local dir = Vector3.zero
+				if not UIS:GetFocusedTextBox() then
+					local cf = cam.CFrame
+					if UIS:IsKeyDown(Enum.KeyCode.W) then dir += cf.LookVector end
+					if UIS:IsKeyDown(Enum.KeyCode.S) then dir -= cf.LookVector end
+					if UIS:IsKeyDown(Enum.KeyCode.D) then dir += cf.RightVector end
+					if UIS:IsKeyDown(Enum.KeyCode.A) then dir -= cf.RightVector end
+					if UIS:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+					if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then dir -= Vector3.yAxis end
+				end
+				flyBV.Velocity = dir.Magnitude > 0 and dir.Unit * F.flySpeed or Vector3.zero
+				flyBG.CFrame = cam.CFrame
+			end
+		elseif flyBV then
+			stopFly()
+		end
+	end)
+
+	c.connect(RunService.Stepped, function()
+		if not F.noclip then
+			if next(noclipped) then restoreNoclip() end
+			return
+		end
+		local ch = lp.Character
+		if not ch then return end
+		for _, p in ipairs(ch:GetDescendants()) do
+			if p:IsA("BasePart") and p.CanCollide then
+				noclipped[p] = true
+				p.CanCollide = false
+			end
+		end
+	end)
+
+	c.cleanups[#c.cleanups + 1] = function()
+		stopFly()
+		restoreNoclip()
+		local ch = lp.Character
+		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+		if hum and origSpeed then hum.WalkSpeed = origSpeed end
+	end
+end
+
+---------------------------------------------------------------- Hub launcher (rectangle with 3 buttons)
+local GAMES = {
+	{
+		id = "EggFarm",
+		label = "Egg Farm Simulator",
+		title = "LSW - Egg Farm Simulator",
+		farm = eggFarm,
+	},
+	{
+		-- no panel: pressing the button loads the LSW Hub loadstring
+		id = "SniperArena",
+		label = "Sniper Arena",
+		run = function()
+			loadstring(game:HttpGet(SNIPER_ARENA_URL))()
+		end,
+	},
+	{
+		id = "BrainrotHeads",
+		label = "Brainrot Heads",
+		title = "LSW - Brainrot Heads",
+		farm = brainrotFarm,
+	},
+}
+
+local hubConns = {}
+local hubGui = Instance.new("ScreenGui")
+hubGui.Name = "LSWHUB_Launcher"
+hubGui.ResetOnSpawn = false
+hubGui.DisplayOrder = 20
+hubGui.Parent = playerGui
+
+local hubFrame = Instance.new("Frame")
+hubFrame.Size = UDim2.fromOffset(280, 232)
+hubFrame.Position = UDim2.new(0.5, -140, 0.5, -116)
+hubFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+hubFrame.BorderSizePixel = 0
+hubFrame.Parent = hubGui
+round(hubFrame, 10)
+
+local hubTitleBar = Instance.new("Frame")
+hubTitleBar.Size = UDim2.new(1, 0, 0, 34)
+hubTitleBar.BackgroundColor3 = Color3.fromRGB(45, 45, 58)
+hubTitleBar.BorderSizePixel = 0
+hubTitleBar.Parent = hubFrame
+round(hubTitleBar, 10)
+
+local hubTitle = makeLabel(hubTitleBar, "LSW Hub", UDim2.new(1, -50, 1, 0), UDim2.new(0, 12, 0, 0))
+hubTitle.Font = Enum.Font.GothamBold
+hubTitle.TextSize = 15
+
+local hubClose = makeButton(hubTitleBar, "X", UDim2.fromOffset(28, 24), UDim2.new(1, -34, 0, 5), OFF_COLOR)
+hubClose.MouseButton1Click:Connect(function()
+	for _, c in ipairs(hubConns) do c:Disconnect() end
+	hubGui:Destroy()
+end)
+
+makeDraggable(function(sig, fn)
+	local c = sig:Connect(fn)
+	hubConns[#hubConns + 1] = c
+	return c
+end, hubTitleBar, hubFrame)
+
+local hint = makeLabel(hubFrame, "Pick a game", UDim2.new(1, -20, 0, 20), UDim2.new(0, 10, 0, 40))
+hint.TextSize = 12
+hint.TextColor3 = Color3.fromRGB(160, 160, 175)
+
+local panels = {}
+for i, g in ipairs(GAMES) do
+	local b = makeButton(hubFrame, g.label, UDim2.new(1, -24, 0, 44), UDim2.new(0, 12, 0, 64 + (i - 1) * 52))
+	b.TextSize = 15
+	b.MouseButton1Click:Connect(function()
+		if g.run then
+			if b.Text ~= g.label then return end -- already loading
+			b.Text = g.label .. " (loading...)"
+			task.spawn(function()
+				local ok, err = pcall(g.run)
+				if not ok then warn("[LSW] " .. tostring(err)) end
+				b.Text = g.label .. (ok and " (loaded)" or " (failed)")
+				task.wait(2)
+				b.Text = g.label
+			end)
+			return
+		end
+		local existing = panels[g.id]
+		if existing and existing.gui and existing.gui.Parent then
+			existing.gui.Enabled = not existing.gui.Enabled
+			return
+		end
+		panels[g.id] = buildPanel(g, function() panels[g.id] = nil end)
+	end)
+end
